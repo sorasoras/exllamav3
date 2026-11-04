@@ -49,7 +49,29 @@ int exl3_gemv_int8_max_k(int device)
     static const int env_max_k = [] { const char* e = getenv("EXL3_INT8_GEMV_MAX_K"); return e ? atoi(e) : 0; }();
     if (env_max_k) return MIN(env_max_k, 8);
     int cc = DevCtx::instance().get_cc(device);
+    if (cc == CC_PASCAL)
+    {
+        // Pascal has no tensor cores, so the regular fp16 kernel is a plain FFMA GEMM at fp32 rates
+        // and the dp4a fold wins at every K it supports. The reference it replaces there is
+        // reconstruct + cuBLAS (4x the weight bytes, twice through memory), not an mma kernel.
+        return 8;
+    }
     return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : 5;
+}
+
+// Shared-memory budget row caps, mirroring GEMV_INT8_SMEM_BUDGET / _ROWS_COOP in
+// exl3_gemv_int8_kernel.cuh. Those are selected by __CUDA_ARCH__ inside the kernel; the host must
+// pick the same value from the device's compute capability or the mirrored decomposition desyncs.
+static int gemv_int8_smem_budget(int device)
+{
+    return DevCtx::instance().get_cc(device) == CC_PASCAL ? GEMV_INT8_SMEM_BUDGET_SM61
+                                                         : GEMV_INT8_SMEM_BUDGET_DEFAULT;
+}
+
+static int gemv_int8_smem_rows_coop(int device)
+{
+    return DevCtx::instance().get_cc(device) == CC_PASCAL ? GEMV_INT8_SMEM_ROWS_COOP_SM61
+                                                         : GEMV_INT8_SMEM_ROWS_COOP_DEFAULT;
 }
 
 struct GemvInt8Workspace
@@ -144,7 +166,7 @@ static bool exl3_gemv_int8_sq
     void* fn = select_gemv_int8_sq_kernel(K, half_k, M, c_fp32, residual);
     if (!fn) return false;
 
-    int rows_max = gemv_int8_sq_rows_max(M, residual);
+    int rows_max = gemv_int8_sq_rows_max(M, residual, gemv_int8_smem_budget(device));
 
     // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
@@ -264,14 +286,14 @@ bool exl3_gemv_int8
     // Half-integer rates take the gate of the integer rate above them
     if (K < 1 || K + (half_k ? 1 : 0) > exl3_gemv_int8_max_k(device)) return false;
 
-    // Both int8 kernels below size their shared memory against a fixed ~80 KB budget baked into
-    // gemv_int8_sq_rows_max() and the coop path's 768-row bound, and - critically - the kernels
-    // recompute rows_per from those same constants on the device, so the host cannot simply ask
-    // for less without desyncing the two. On Turing (64 KB) the cudaFuncSetAttribute would fail
-    // and the following cuda_check would abort the process. This path is a decode-time
-    // optimization over the regular fp16 tensor-core kernel, which handles the same work, so
-    // declining is a performance loss and nothing more.
-    if (DevCtx::instance().get_smem_max(device) < 80 * 1024) return false;
+    // Both int8 kernels below size their shared memory against a per-arch budget (80 KB on Ampere+,
+    // 32 KB on Pascal) baked into gemv_int8_sq_rows_max() and the coop path's row bound, and -
+    // critically - the kernels recompute rows_per from those same constants on the device, so the
+    // host cannot simply ask for less without desyncing the two. On Turing (64 KB opt-in) and
+    // Pascal (48 KB, no opt-in at all) the cudaFuncSetAttribute would fail and the following
+    // cuda_check would abort the process. This path is a decode-time optimization over the regular
+    // fp16 kernel, so declining is a performance loss and nothing more.
+    if (DevCtx::instance().get_smem_max(device) < gemv_int8_smem_budget(device)) return false;
 
     int num_sms = DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
@@ -294,11 +316,12 @@ bool exl3_gemv_int8
 
     // Mirror the kernel's work decomposition for the shared memory size; grid = max co-resident
     // blocks (natural register allocation measures faster than forcing higher occupancy)
+    int smem_rows_coop = gemv_int8_smem_rows_coop(device);
     auto smem_for_grid = [&] (int grid_) -> size_t
     {
         int rows_total = size_k / 16;
         int nb256 = size_n / 256;
-        int smem_rows_max = residual ? 384 : 768;
+        int smem_rows_max = residual ? (smem_rows_coop / 2) : smem_rows_coop;
         int ksplit = CEIL_DIVIDE(4 * grid_, nb256);
         ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
         ksplit = MIN(ksplit, rows_total);
@@ -310,7 +333,7 @@ bool exl3_gemv_int8
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         // Upper bound over all shapes: smem_rows_max * 64 B
-        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_rows_coop * 16 * 4 + GEMV_STAGE_MAX_BYTES);
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
         // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
         // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in

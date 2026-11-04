@@ -13,6 +13,7 @@ namespace cg = cooperative_groups;
 #include "exl3_devctx.cuh"
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
+#include "exl3_gemv_simt.cuh"
 #include "coop_autotune.cuh"
 #include <set>
 #include <vector>
@@ -227,6 +228,24 @@ int exl3_gemm_gr
             graph->record_param(kernel_ptr, GP_end, 0);
         }
     };
+
+    // Everything past this point is an mma kernel, and on Pascal those wrappers compile to __trap()
+    // stubs, so the QTIP GEMV below is out as well. Before giving up, try the tensor-core-free
+    // decode GEMV, which covers the cb0/cb1 codebooks the int8 dp4a fold cannot.
+    if (cc == CC_PASCAL)
+    {
+        if (exl3_gemv_simt(A, B, C, suh, A_had, svh, size_m, size_k, size_n, K, half_k, cb, c_fp32, stream))
+        {
+            cuda_check(cudaPeekAtLastError());
+            return 0;
+        }
+        TORCH_CHECK(false,
+            "exl3_gemm: no tensor-core-free kernel covers shape m={} k={} n={} (K={}, codebook={}) "
+            "on a pre-Volta device. On Pascal only mul1 tensors with K <= 8 can run the int8 dp4a "
+            "GEMV; route the rest through reconstruction (reconstruct=True) so prefill and other "
+            "codebooks use reconstruct + cuBLAS.",
+            size_m, size_k, size_n, K, cb);
+    }
 
     // QTIP-style GEMV path for small m (exl3_gemv_kernel.cuh). Same kernel arguments, so graph
     // recording is identical; falls through to the regular kernel when the heuristic declines
@@ -587,6 +606,15 @@ int exl3_mgemm_gr
             graph->record_param(kernel_ptr, GP_end, 0);
         }
     };
+
+    // Same reasoning as exl3_gemm_gr: every MoE kernel is mma-based and traps on Pascal. MoE on a
+    // Pascal secondary card has no implementation yet, so refuse rather than trap.
+    if (DevCtx::instance().get_cc(device) == CC_PASCAL)
+    {
+        TORCH_CHECK(false,
+            "exl3_mgemm: MoE expert GEMM has no tensor-core-free path on a pre-Volta device. "
+            "Run the MoE layers on a newer GPU (layer split), or use a dense model on Pascal.");
+    }
 
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)

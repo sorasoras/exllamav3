@@ -41,7 +41,12 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
     const uint32_t* bb = reinterpret_cast<const uint32_t*>(&b);
     uint32_t* cc = reinterpret_cast<uint32_t*>(&c);
-#if EXL3_SM75
+#if EXL3_SM61
+    // Pre-Volta has no tensor cores, and nothing dispatches this GEMV there (see the CC_PASCAL
+    // check in exl3_gemm), so the body only has to compile.
+    (void) a0; (void) a1; (void) bb; (void) cc;
+    __trap();
+#elif EXL3_SM75
     asm
     (
         "mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 "

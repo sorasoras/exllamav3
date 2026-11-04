@@ -2,7 +2,7 @@ import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
-from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
+from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache, fn_torch_paged_attn_fallback
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
     _qc_staging,
@@ -39,6 +39,28 @@ _fns_qc: list[AttnFn] = [
 # with full-size fp16 temporaries for A/B testing
 _qc_attn = _qc_staging < 2
 
+# Triton's CUDA backend targets sm_70+ and JIT-fails on pre-Volta parts (Pascal, sm_61) instead of
+# declining with None, so on those devices the Triton kernels must be filtered out of the candidate
+# list rather than merely deprioritized. What remains is the scalar/torch/xformers chain, which is
+# correct everywhere.
+_triton_fns = set(_fns_triton_fast) | set(_fns_qc) | {
+    fn_triton_attn_nocache,
+    fn_triton_paged_attn,
+    fn_triton_paged_attn_longq,
+}
+
+_pre_ampere_devices: dict[int, bool] = {}
+
+def _is_pre_ampere(t: torch.Tensor) -> bool:
+    if not t.is_cuda:
+        return False
+    idx = t.device.index or 0
+    v = _pre_ampere_devices.get(idx)
+    if v is None:
+        v = torch.cuda.get_device_capability(idx)[0] < 7
+        _pre_ampere_devices[idx] = v
+    return v
+
 attn_fns: list[AttnFn] = _fns_triton_fast + [
     fn_triton_attn_nocache,
     fn_triton_paged_attn,
@@ -47,6 +69,7 @@ attn_fns: list[AttnFn] = _fns_triton_fast + [
     fn_xformers_cutlass_fallback_cache,
     fn_xformers_cutlass_fallback_nocache,
     fn_torch_sdpa_fallback_cache,
+    fn_torch_paged_attn_fallback,
     fn_torch_sdpa_fallback_nocache
 ]
 
@@ -112,7 +135,9 @@ def attn_dispatch(
 
     # Get cache tensors. Quantized layers pass their packed tensors straight to the attention
     # kernels when possible: new K/V are quantized into the cache up front and never
-    # materialized as full fp16 cache-sized temporaries
+    # materialized as full fp16 cache-sized temporaries. The quant-direct path is Triton-only, so
+    # pre-Volta devices keep the fp16 cache and the torch/scalar backends.
+    pre_ampere = _is_pre_ampere(q)
     q_cache = None
     if cache is not None:
         assert block_table is not None
@@ -120,6 +145,7 @@ def attn_dispatch(
         layer = cache if isinstance(cache, CacheLayer) else cache.layers[cache_idx, cache_instance or 0]
         if (
             _qc_attn and
+            not pre_ampere and
             isinstance(layer, CacheLayer_quant) and
             layer.compand_a == 0.0 and
             q.dtype == torch.float16 and
@@ -161,6 +187,8 @@ def attn_dispatch(
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
     # and would accept them as cache-less)
     candidates = _fns_qc if q_cache is not None else attn_fns
+    if pre_ampere:
+        candidates = [fn for fn in candidates if fn not in _triton_fns]
     hint_key = "fn_qc" if q_cache is not None else "fn"
 
     # Retry the backend that matched last time for this caller before scanning the full list.

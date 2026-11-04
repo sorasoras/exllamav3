@@ -18,11 +18,43 @@
 //                          filtered out of kernel selection rather than failing at launch.
 //
 // ldmatrix, __nanosleep, __dp4a and tanh.approx.f32 are all sm_75-capable and need no gate.
+//
+// Pascal (sm_61) goes one step further: it has no tensor cores at all, so every mma, ldmatrix,
+// scoped acquire/release and __nanosleep below sm_70 is out. The tensor-core entry points are
+// kept in the same fatbin but compiled to __trap() stubs; the dispatcher is responsible for
+// never selecting them. Decode runs through the int8 dp4a GEMV (exl3_gemv_int8) and prefill
+// through reconstruct + cuBLAS, both of which are plain SIMT and need nothing new here.
+//
+// EXL3_SM75 keeps its existing meaning ("pre-Ampere"), so the cp.async fallbacks already
+// cover Pascal; EXL3_SM61 only gates the Volta+ instructions.
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    #define EXL3_SM61 1
+#else
+    #define EXL3_SM61 0
+#endif
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
     #define EXL3_SM75 1
 #else
     #define EXL3_SM75 0
+#endif
+
+// __nanosleep is sm_70+. Below that it is not declared at all, so callers go through this
+// macro; the spin loops that use it re-read a flag every iteration and are correct without it.
+#if EXL3_SM61
+    #define EXL3_NANOSLEEP(ns) ((void) (ns))
+#else
+    #define EXL3_NANOSLEEP(ns) __nanosleep(ns)
+#endif
+
+// __grid_constant__ is rejected by ptxas below compute_70. Without it the parameter is simply
+// copied to local memory, which is what pre-Volta did anyway, so dropping the annotation keeps
+// the kernel correct there (only the const-address guarantee is lost).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    #define EXL3_GRID_CONSTANT
+#else
+    #define EXL3_GRID_CONSTANT __grid_constant__
 #endif
 
 // Dynamic shared memory per block. SMEM_MAX stays at the sm_86 value because it only bounds

@@ -27,6 +27,12 @@ __device__ inline void ptx_mma_m8n8k4
     Vec<float, 8>& frag_c
 )
 {
+#if EXL3_SM61
+    (void) frag_a;
+    (void) frag_b;
+    (void) frag_c;
+    __trap();
+#else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -43,6 +49,7 @@ __device__ inline void ptx_mma_m8n8k4
            "r"(b[0]), "r"(b[1]),
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]), "f"(d[4]), "f"(d[5]), "f"(d[6]), "f"(d[7])
     );
+#endif
 }
 
 // m16n8k16 tensor core matmul
@@ -69,6 +76,10 @@ __device__ inline void ptx_mma_m16n8k16
     FragC& frag_c
 )
 {
+#if EXL3_SM61
+    (void) frag_a; (void) frag_b; (void) frag_c;
+    __trap();
+#else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     float* c = reinterpret_cast<float*>(&frag_c);
@@ -107,6 +118,7 @@ __device__ inline void ptx_mma_m16n8k16
            "f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3])
     );
 #endif
+#endif
 }
 
 // FP16 @ FP16 + FP16 -> FP16
@@ -117,6 +129,10 @@ __device__ inline void ptx_mma_m16n8k16
     FragC_h& frag_c
 )
 {
+#if EXL3_SM61
+    (void) frag_a; (void) frag_b; (void) frag_c;
+    __trap();
+#else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
@@ -155,6 +171,7 @@ __device__ inline void ptx_mma_m16n8k16
            "r"(d[0]), "r"(d[1])
     );
 #endif
+#endif
 }
 
 // Global barrier
@@ -168,11 +185,22 @@ __device__ inline void barrier_acquire
     if (threadIdx.x == 0)
     {
         volatile int state = -1;
+#if EXL3_SM61
+        // Pre-Volta has no ld.acquire.gpu. A volatile read polls coherent L2, and the fence
+        // publishes everything the releasing block wrote before it bumped the counter.
+        do
+        {
+            state = *reinterpret_cast<volatile int*>(lock);
+        }
+        while (state != stage);
+        __threadfence();
+#else
         do
         {
             asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
         }
         while (state != stage);
+#endif
     }
     __syncthreads();
 }
@@ -192,8 +220,15 @@ __device__ inline void barrier_release
             *lock = 0;
             return;
         }
+#if EXL3_SM61
+        // No fence.acq_rel.gpu / red.relaxed.gpu before sm_70: publish the block's writes with
+        // a device fence, then bump the counter with a plain (system-scoped) atomic add.
+        __threadfence();
+        atomicAdd(lock, val);
+#else
         asm volatile ("fence.acq_rel.gpu;\n");
         asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
+#endif
     }
 }
 
@@ -290,6 +325,11 @@ __device__ inline void cp_async_wait()
 
 __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 {
+#if EXL3_SM61
+    (void) frag_a;
+    (void) smem_ptr;
+    __trap();
+#else
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile
@@ -297,6 +337,7 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
     );
+#endif
 }
 
 __device__ inline uint32_t mul_lo_u32(uint32_t x, uint32_t y)
@@ -355,27 +396,49 @@ __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 {
+#if EXL3_SM61
+    uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
+    __threadfence();
+    return v;
+#else
     uint32_t v;
     asm volatile("ld.global.acquire.sys.u32 %0, [%1];"
                  : "=r"(v) : "l"(p) : "memory");
     return v;
+#endif
 }
 
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 {
+#if EXL3_SM61
+    uint64_t v = *reinterpret_cast<const volatile uint64_t*>(p);
+    __threadfence();
+    return v;
+#else
     uint64_t v;
     asm volatile("ld.global.acquire.sys.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
     return v;
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
 {
+#if EXL3_SM61
+    __threadfence();
+    *reinterpret_cast<volatile uint32_t*>(p) = v;
+#else
     asm volatile("st.global.release.sys.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#endif
 }
 
 __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
 {
+#if EXL3_SM61
+    __threadfence();
+    *reinterpret_cast<volatile uint64_t*>(p) = v;
+#else
     asm volatile("st.global.release.sys.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+#endif
 }
 
 // Global time in nanoseconds
@@ -428,7 +491,7 @@ __device__ inline void group_barrier
         }
         else
         {
-            while (sense.load(cuda::memory_order_acquire) == old_sense) __nanosleep(32);
+            while (sense.load(cuda::memory_order_acquire) == old_sense) EXL3_NANOSLEEP(32);
         }
     }
 

@@ -341,6 +341,24 @@ __device__ __forceinline__ void gemv_int8_row_sums
 #define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
 #define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
 
+// Dynamic shared-memory budget the row decomposition targets. Ampere+ can opt in to 100 KB+, so the
+// row caps below are sized for ~80 KB. Pascal (sm_61) is hard-capped at 48 KB with no opt-in, and
+// its row caps have to come down with it. The decomposition is mirrored on the host, which cannot
+// see __CUDA_ARCH__, so the host picks the same value from the device's compute capability
+// (gemv_int8_smem_budget in exl3_gemv_int8.cu). Keep the two in sync.
+#define GEMV_INT8_SMEM_BUDGET_DEFAULT (80 * 1024)
+#define GEMV_INT8_SMEM_BUDGET_SM61    (32 * 1024)
+#define GEMV_INT8_SMEM_ROWS_COOP_DEFAULT 768
+#define GEMV_INT8_SMEM_ROWS_COOP_SM61    384
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+#define GEMV_INT8_SMEM_BUDGET GEMV_INT8_SMEM_BUDGET_SM61
+#define GEMV_INT8_SMEM_ROWS_COOP GEMV_INT8_SMEM_ROWS_COOP_SM61
+#else
+#define GEMV_INT8_SMEM_BUDGET GEMV_INT8_SMEM_BUDGET_DEFAULT
+#define GEMV_INT8_SMEM_ROWS_COOP GEMV_INT8_SMEM_ROWS_COOP_DEFAULT
+#endif
+
 // Per-slice-scale ("sq") kernel parameters
 #define SQ_KSPLIT_CAP 64
 #define SQ_MINROWS 16       // minimum slice height (staging overhead amortization)
@@ -990,10 +1008,12 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
 }
 
 // Shared-memory cap for the sq decomposition: row halfs (32 B/row) + M splat regions (64 B/row each,
-// x2 residual), within ~80 KB so the stage region and epilogue staging still fit under the opt-in max
-__host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
+// x2 residual), within the arch's budget so the stage region and epilogue staging still fit.
+// `budget` is GEMV_INT8_SMEM_BUDGET on the device; the host passes the value it derived from the
+// device's compute capability, so the two decompositions stay identical.
+__host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual, int budget)
 {
-    int cap = (80 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
+    int cap = budget / (32 + 64 * M * (residual ? 2 : 1));
     cap &= ~7;
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
@@ -1026,7 +1046,7 @@ void exl3_gemv_int8_sq_kernel
     int r = CEIL_DIVIDE(rows_total * nb256_total, (int) gridDim.x);
     int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
     rows_per = MAX(rows_per, SQ_MINROWS);
-    rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual));
+    rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual, GEMV_INT8_SMEM_BUDGET));
     rows_per = MIN(rows_per, (rows_total + 7) & ~7);
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;
@@ -1190,7 +1210,7 @@ void exl3_gemv_int8_coop_kernel
     // because with grid.sync at the end of the phase, tail imbalance stalls the whole grid.
     int rows_total = size_k >> 4;
     int nb256_total = size_n / 256;
-    int smem_rows_max = residual ? 384 : 768;
+    int smem_rows_max = residual ? (GEMV_INT8_SMEM_ROWS_COOP / 2) : GEMV_INT8_SMEM_ROWS_COOP;
     int ksplit = CEIL_DIVIDE(4 * gridDim.x, nb256_total);
     ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
     ksplit = MIN(ksplit, rows_total);

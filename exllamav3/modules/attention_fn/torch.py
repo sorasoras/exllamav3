@@ -82,6 +82,40 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
         return torch.cat(o, dim = 1)
 
 
+def fn_torch_paged_attn_fallback(args: AttnArgs) -> torch.Tensor | None:
+    """
+    SDPA over a paged fp16 cache with no head-dim floor. The big-head fallbacks above decline
+    dim < 512, which on pre-Volta devices (no Triton backend) leaves nothing at all, so this
+    accepts any head dim as long as the cache layout is one _torch_bighead_fallback can gather.
+    """
+    if (
+        args.is_varlen() or
+        not args.has_kv_cache() or
+        args.softcap != 0.0 or
+        args.sinks is not None or
+        args.is_swa()
+    ):
+        return None
+
+    if not args.non_causal_spans:
+        return _torch_bighead_fallback(
+            q = args.q,
+            k = args.k,
+            v = args.v,
+            k_cache = args.k_cache,
+            v_cache = args.v_cache,
+            block_table = args.block_table,
+            cache_seqlens = args.cache_seqlens,
+            causal = args.causal,
+            softmax_scale = args.sm_scale,
+            window_size = args.get_window_size(),
+            softcap = args.softcap
+        )
+    else:
+        arglist = get_non_causal_span_arglist(args)
+        return torch.cat([_torch_bighead_fallback(**a) for a in arglist], dim = 1)
+
+
 def _torch_bighead_fallback(
     q, k, v,
     k_cache, v_cache,

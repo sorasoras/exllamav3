@@ -63,6 +63,16 @@ class InferParams:
         self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
+        # Pre-Volta devices have no MGEMM kernel (all of them are mma-based), so the projections
+        # must stay separate and fall back to reconstruct + cuBLAS or the int8 GEMV. This has to be
+        # decided before the mul1 test below, which keeps fused MGEMM for cb0/cb1 tensors
+        if device is not None:
+            import torch
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            if dev.type == "cuda":
+                idx = dev.index if dev.index is not None else torch.cuda.current_device()
+                if torch.cuda.get_device_capability(idx)[0] < 7:
+                    return False
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:

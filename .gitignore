@@ -10,3 +10,17 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+exllamav3_ext.*.pyd
+*.pyd
+build_sm61.log
+tune_*.exe
+tune_*.log
+*.obj
+*.exp
+*.lib
+sweep_stdout.txt
+venv-setup.done
+sweep_out/
+.venv/
+*.stackdump
+*.exe

@@ -1,5 +1,59 @@
 #pragma once
 
+// On GP102-class parts (the P40 included) every fp16 arithmetic instruction runs at 1/64 of the
+// fp32 rate, and the codebook decode is one half add (or fma) per weight, so on a pre-Volta
+// device those few instructions dominate the whole GEMV. The same values converted to fp32 and
+// back round identically for the add (a sum of two halves is exact in fp32, and hadd rounds the
+// same exact sum), and within 1 ulp for the mul1 fma, so the substitution is safe and the
+// kernels go from half-rate to full-rate arithmetic.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700)
+    #define EXL3_CODEBOOK_F32 1
+#else
+    #define EXL3_CODEBOOK_F32 0
+#endif
+
+__device__ __forceinline__
+half exl3_hadd(half a, half b)
+{
+    #if EXL3_CODEBOOK_F32
+        return __float2half(__half2float(a) + __half2float(b));
+    #else
+        return __hadd(a, b);
+    #endif
+}
+
+__device__ __forceinline__
+half2 exl3_hadd2(half2 a, half2 b)
+{
+    #if EXL3_CODEBOOK_F32
+        return __floats2half2_rn(__half2float(a.x) + __half2float(b.x),
+                                 __half2float(a.y) + __half2float(b.y));
+    #else
+        return __hadd2(a, b);
+    #endif
+}
+
+__device__ __forceinline__
+half2 exl3_hfma2(half2 a, half2 b, half2 c)
+{
+    #if EXL3_CODEBOOK_F32
+        return __floats2half2_rn(fmaf(__half2float(a.x), __half2float(b.x), __half2float(c.x)),
+                                 fmaf(__half2float(a.y), __half2float(b.y), __half2float(c.y)));
+    #else
+        return __hfma2(a, b, c);
+    #endif
+}
+
+__device__ __forceinline__
+half exl3_hfma(half a, half b, half c)
+{
+    #if EXL3_CODEBOOK_F32
+        return __float2half(fmaf(__half2float(a), __half2float(b), __half2float(c)));
+    #else
+        return __hfma(a, b, c);
+    #endif
+}
+
 // This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
 // nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%
 // faster end-to-end at m=1. Kept as a hook in case it regresses again.
@@ -38,7 +92,7 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39 = (-1024.0 - 510.0) * k_inv_h
     half_uint16 h0((uint16_t) sum0);
     half_uint16 h1((uint16_t) sum1);
-    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+    return exl3_hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
 }
 
 // Ditto mcg (cb 1)
@@ -50,7 +104,7 @@ __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
     half2_uint32 xu1(x1);
     half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
     half2 d1 = __highs2half2(xu0.as_half2, xu1.as_half2);
-    return __hadd2(d0, d1);
+    return exl3_hadd2(d0, d1);
 }
 
 template <int cb>
@@ -62,7 +116,7 @@ __device__ inline half decode_3inst(uint32_t x)
         x += 64248484u;
         asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
         half2_uint32 xu(x);
-        return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
+        return exl3_hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
     if constexpr (cb == 1)
     {
@@ -71,7 +125,7 @@ __device__ inline half decode_3inst(uint32_t x)
 
         asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
         half2_uint32 xu(x);
-        return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
+        return exl3_hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
     }
     if constexpr (cb == 2)
     {
@@ -85,7 +139,7 @@ __device__ inline half decode_3inst(uint32_t x)
         const __half k_inv_h = __ushort_as_half(0x1eee);  //  0.00677 = 1/147.7
         const __half k_bias_h = __ushort_as_half(0xc931);  // -10.39 = (-1024.0 - 510.0) * k_inv_h
         half_uint16 h((uint16_t) sum);
-        return __hfma(h.as_half, k_inv_h, k_bias_h);
+        return exl3_hfma(h.as_half, k_inv_h, k_bias_h);
     }
 }
 
@@ -104,7 +158,7 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         half2_uint32 xu1(x1);
         half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
         half2 d1 = __highs2half2(xu0.as_half2, xu1.as_half2);
-        return __hadd2(d0, d1);
+        return exl3_hadd2(d0, d1);
     }
     if constexpr (cb == 1)
     {

@@ -133,6 +133,17 @@ def finalize_out_sensitivity(capture: dict) -> dict:
         for key, acc in capture.items()
     }
 
+
+def _no_graph_path(device) -> bool:
+    """The graphed bsz-1 MLP paths (BC_MLP / BC_GatedMLP) run the mma GEMM kernel map, which does
+    not exist below sm_70. Skipping them sends decode through the regular module path."""
+    d = torch.device(device)
+    if d.type != "cuda":
+        return True
+    idx = d.index if d.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(idx)[0] < 7
+
+
 class MLP(Module):
 
     def __init__(
@@ -308,6 +319,7 @@ class MLP(Module):
         self.bc = None
         if (
             device != torch.device("cpu") and
+            not _no_graph_path(device) and
             self.num_slices == 1 and
             self.activation_fn in ("silu", "gelu", "relu2") and
             self.interm_dtype in (None, torch.half) and
@@ -779,7 +791,8 @@ class GatedMLP(Module):
         # calls (the unfused configuration the int8-activation GEMV mode prefers)
         # (not with interm_div: the graph has no hook for the pre-activation rescale)
         self.bc = None
-        if self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None:
+        if (self.num_slices == 1 and self.interm_div == 1.0 and
+                self.downs[0].inner.bc is not None and not _no_graph_path(self.device)):
             mgu = self.multi_gu[0]
             g0, u0 = self.gates[0], self.ups[0]
             can_separate = (

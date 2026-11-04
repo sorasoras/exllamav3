@@ -32,7 +32,7 @@ void pg_gather_kernel
     const int out_device,
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ out_data_ptr,
-    const Offsets __grid_constant__ all_offsets,
+    const Offsets EXL3_GRID_CONSTANT all_offsets,
     const int batch,
     uint8_t* __restrict__ shbuf_ptr,
     const size_t data_size,
@@ -79,7 +79,7 @@ void pg_gather_kernel
             uint32_t sleep = SYNC_MIN_SLEEP;
             while ((int) ldg_acquire_sys_u32(stage_ptr) < min_stage)
             {
-                __nanosleep(sleep);
+                EXL3_NANOSLEEP(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else *abort_flag = check_timeout(ctx, deadline, "gather (0)");
                 if (*abort_flag) break;
@@ -172,7 +172,7 @@ void pg_gather_kernel
                 }
                 else
                 {
-                    __nanosleep(sleep);
+                    EXL3_NANOSLEEP(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "gather (1)");
                     if (*abort_flag) break;
@@ -222,7 +222,7 @@ void pg_gather_kernel
             }
             else
             {
-                __nanosleep(sleep);
+                EXL3_NANOSLEEP(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else *abort_flag = check_timeout(ctx, deadline, "gather (2)");
                 if (*abort_flag) break;
@@ -253,7 +253,7 @@ void pg_gather_small_kernel
     const int out_device,
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ out_data_ptr,
-    const Offsets __grid_constant__ all_offsets,
+    const Offsets EXL3_GRID_CONSTANT all_offsets,
     const int batch,
     uint8_t* __restrict__ shbuf_ptr,
     const size_t data_size,
@@ -296,7 +296,7 @@ void pg_gather_small_kernel
                 uint64_t deadline = sync_deadline();
                 while (!*abort_flag && ldg_acquire_sys_u32(ctx->gather_stage_produced + src_rank) < 1)
                 {
-                    __nanosleep(sleep);
+                    EXL3_NANOSLEEP(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "gather_small");
                 }

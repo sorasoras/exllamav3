@@ -655,10 +655,24 @@ def _qsa_module_eligible(m):
     )
 
 
+def _capable_device(m) -> bool:
+    """The captured block runs the mma GEMM kernel map and the Triton attention kernels, so it
+    needs at least sm_70. Below that (Pascal) the eager path is the only option."""
+    d = getattr(m, "device", None)
+    if d is None:
+        return False
+    d = torch.device(d)
+    if d.type != "cuda":
+        return False
+    idx = d.index if d.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(idx)[0] >= 7
+
+
 def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
+        _capable_device(m) and
         _qsa_module_eligible(m) and
         # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
         # kernel, so a norm-only module without rope has nowhere to apply them

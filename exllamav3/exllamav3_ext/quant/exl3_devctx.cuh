@@ -24,6 +24,7 @@
 #define CC_ADA        3
 #define CC_HOPPER     4
 #define CC_BLACKWELL  5
+#define CC_PASCAL     6   // sm_61: no tensor cores, decode runs on the dp4a GEMV
 
 // Singleton to manage context for each device. Stores device attributes and a large-enough lock buffer per device
 class DevCtx
